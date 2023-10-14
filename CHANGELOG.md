@@ -18,6 +18,7 @@
 * Changed TriangleMesh to store materials in a list so they can be accessed by the material index (PR #5938)
 * Support multi-threading in the RayCastingScene function to commit scene (PR #6051).
 * Fix some bad triangle generation in TriangleMesh::SimplifyQuadricDecimation
+* Introduce new optional dependencies support, allowing you to do `pip install open3d[standard]`
 
 ## 0.13
 
