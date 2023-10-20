@@ -32,9 +32,13 @@ Pip (PyPI)
 
 .. code-block:: bash
 
-    pip install open3d        # or
-    pip install open3d-cpu    # Smaller CPU only wheel on x86_64 Linux (since v0.17+)
+    pip install open3d[gui,ml]        # or
+    pip install open3d-cpu[gui,ml]    # Smaller CPU only wheel on x86_64 Linux (since v0.17+)
 
+.. note::
+   Above will work for most purposes and aligns with behavior seen in `v0.17` and below.
+   Using anything under :mod:`open3d.visualization` will require ``[gui]`` where as
+   using anything under :mod:`open3d.ml` will require ``[ml]``.
 
 .. note::
    Please upgrade your ``pip`` to a version >=20.3 to install Open3D in Linux,
@@ -51,11 +55,11 @@ Pip (PyPI)
 
     .. code-block:: bash
 
-        pip3 install open3d
+        pip3 install open3d[gui,ml]
         # or
-        pip install --user open3d
+        pip install --user open3d[gui,ml]
         # or
-        python3 -m pip install --user open3d
+        python3 -m pip install --user open3d[gui,ml]
 
 Development version (pip)
 -------------------------
@@ -97,7 +101,7 @@ install the latest development version directly with pip:
 
 .. code-block:: bash
 
-    pip install -U --trusted-host www.open3d.org -f http://www.open3d.org/docs/latest/getting_started.html open3d
+    pip install -U --trusted-host www.open3d.org -f http://www.open3d.org/docs/latest/getting_started.html open3d[gui,ml]
 
 .. note::
    The development wheels for Linux are named according to PEP600. Please
