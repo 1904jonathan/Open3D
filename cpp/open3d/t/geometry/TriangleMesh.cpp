@@ -7,6 +7,10 @@
 
 #include "open3d/t/geometry/TriangleMesh.h"
 
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
+#include <tbb/parallel_for_each.h>
+#include <tbb/partitioner.h>
 #include <vtkBooleanOperationPolyDataFilter.h>
 #include <vtkCleanPolyData.h>
 #include <vtkClipPolyData.h>
@@ -16,23 +20,42 @@
 #include <vtkQuadricDecimation.h>
 
 #include <Eigen/Core>
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstddef>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <tuple>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include "open3d/core/CUDAUtils.h"
+#include "open3d/core/Device.h"
+#include "open3d/core/Dtype.h"
 #include "open3d/core/EigenConverter.h"
+#include "open3d/core/ParallelFor.h"
 #include "open3d/core/ShapeUtil.h"
 #include "open3d/core/Tensor.h"
 #include "open3d/core/TensorCheck.h"
+#include "open3d/core/TensorKey.h"
+#include "open3d/core/linalg/AddMM.h"
+#include "open3d/core/linalg/Matmul.h"
 #include "open3d/t/geometry/LineSet.h"
 #include "open3d/t/geometry/PointCloud.h"
 #include "open3d/t/geometry/RaycastingScene.h"
 #include "open3d/t/geometry/VtkUtils.h"
+#include "open3d/t/geometry/kernel/IPPImage.h"
 #include "open3d/t/geometry/kernel/PCAPartition.h"
 #include "open3d/t/geometry/kernel/PointCloud.h"
 #include "open3d/t/geometry/kernel/Transform.h"
 #include "open3d/t/geometry/kernel/TriangleMesh.h"
 #include "open3d/t/geometry/kernel/UVUnwrapping.h"
+#include "open3d/t/io/ImageIO.h"
+#include "open3d/t/io/NumpyIO.h"
+#include "open3d/utility/Optional.h"
 #include "open3d/utility/ParallelScan.h"
 
 namespace open3d {
@@ -989,7 +1012,7 @@ TriangleMesh::BakeTriangleAttrTextures(
         }
         core::Tensor tensor =
                 triangle_attr_.at(attr).To(core::Device()).Contiguous();
-        DISPATCH_DTYPE_TO_TEMPLATE(tensor.GetDtype(), [&]() {
+        DISPATCH_DTYPE_TO_TEMPLATE_WITH_BOOL(tensor.GetDtype(), [&]() {
             core::Tensor tex;
             if (GetTriangleIndices().GetDtype() == core::Int32) {
                 tex = BakeAttribute<scalar_t, int32_t, false>(
@@ -1166,7 +1189,8 @@ static bool IsNegative(T val) {
     return false;
 }
 
-TriangleMesh TriangleMesh::SelectByIndex(const core::Tensor &indices) const {
+TriangleMesh TriangleMesh::SelectByIndex(const core::Tensor &indices,
+                                         bool copy_attributes /*=true*/) const {
     core::AssertTensorShape(indices, {indices.GetLength()});
     if (indices.NumElements() == 0) {
         return {};
@@ -1266,7 +1290,8 @@ TriangleMesh TriangleMesh::SelectByIndex(const core::Tensor &indices) const {
     if (tris_cpu.NumElements() > 0) {  // To() needs non-empty tensor
         result.SetTriangleIndices(tris_cpu.To(GetDevice()));
     }
-    CopyAttributesByMasks(result, *this, vertex_mask, tri_mask);
+    if (copy_attributes)
+        CopyAttributesByMasks(result, *this, vertex_mask, tri_mask);
 
     return result;
 }
@@ -1321,9 +1346,435 @@ TriangleMesh TriangleMesh::RemoveUnreferencedVertices() {
 
     utility::LogDebug(
             "[RemoveUnreferencedVertices] {:d} vertices have been removed.",
-            (int)(num_verts_old - GetVertexPositions().GetLength()));
+            static_cast<int>(num_verts_old - GetVertexPositions().GetLength()));
 
     return *this;
+}
+
+namespace {
+
+core::Tensor Project(const core::Tensor &t_xyz,  // contiguous {...,3}
+                     const core::Tensor &t_intrinsic_matrix,  // {3,3}
+                     const core::Tensor &t_extrinsic_matrix,  // {4,4}
+                     core::Tensor &t_xy) {  // contiguous {...,2}
+    auto xy_shape = t_xyz.GetShape();
+    auto dt = t_xyz.GetDtype();
+    auto t_K = t_intrinsic_matrix.To(dt).Contiguous(),
+         t_T = t_extrinsic_matrix.To(dt).Contiguous();
+    xy_shape[t_xyz.NumDims() - 1] = 2;
+    if (t_xy.GetDtype() != dt || t_xy.GetShape() != xy_shape) {
+        t_xy = core::Tensor(xy_shape, dt);
+    }
+    DISPATCH_FLOAT_DTYPE_TO_TEMPLATE(dt, [&]() {
+        // Eigen is column major
+        Eigen::Map<Eigen::MatrixX<scalar_t>> xy(t_xy.GetDataPtr<scalar_t>(), 2,
+                                                t_xy.NumElements() / 2);
+        Eigen::Map<const Eigen::MatrixX<scalar_t>> xyz(
+                t_xyz.GetDataPtr<scalar_t>(), 3, t_xyz.NumElements() / 3);
+        Eigen::Map<const Eigen::Matrix3<scalar_t>> KT(
+                t_K.GetDataPtr<scalar_t>());
+        Eigen::Map<const Eigen::Matrix4<scalar_t>> TT(
+                t_T.GetDataPtr<scalar_t>());
+
+        auto K = KT.transpose();
+        auto T = TT.transpose();
+        auto R = T.topLeftCorner<3, 3>();
+        auto t = T.topRightCorner<3, 1>();
+        auto pxyz = (K * ((R * xyz).colwise() + t)).array();
+        xy = pxyz.topRows<2>().rowwise() / pxyz.bottomRows<1>();
+    });
+    return t_xy;  // contiguous {...,2}
+}
+
+/// Estimate contrast and brightness in each color channel for this_albedo to
+/// match albedo, based on the overlapping area in the texture image. Contrast
+/// and brightness are estimated by matching the second and first moments
+/// (variance and mean) of the pixel colors, respectively.
+/// albedo and this_albedo are float images with range [0,1]
+std::tuple<std::array<float, 3>,
+           std::array<float, 3>,
+           core::Tensor,
+           core::Tensor>
+get_color_correction(const core::Tensor &albedo,
+                     const core::Tensor &this_albedo,
+                     float SPECULAR_THRESHOLD) {
+    const double EPS = 1e-6;
+    const float shift = 0.5f;  // compute shifted sum / sumsqr for stability.
+    const unsigned MIN_OVERLAP_PIXELS = 32 * 32;
+    // Perform the color correction with albedo downsampled to size 256x256.
+    float resize_down = 256.f / albedo.GetShape(0)
+            /*,resize_up = albedo.GetShape(0) / 256.f*/;
+    std::array<float, 3> this_contrast{1.f, 1.f, 1.f},
+            this_brightness{0.f, 0.f, 0.f}, sum{}, this_sum{}, sumsqr{},
+            this_sumsqr{};
+    auto q_albedo = Image(albedo)
+                            .Resize(resize_down, Image::InterpType::Linear)
+                            .AsTensor();
+    auto q_this_albedo = Image(this_albedo)
+                                 .Resize(resize_down, Image::InterpType::Linear)
+                                 .AsTensor();
+    unsigned count = 0;
+    for (float *pq_albedo = q_albedo.GetDataPtr<float>(),
+               *pq_this_albedo = q_this_albedo.GetDataPtr<float>();
+         pq_albedo < q_albedo.GetDataPtr<float>() + q_albedo.NumElements();
+         pq_albedo += 4, pq_this_albedo += 4) {
+        if (pq_albedo[3] <= EPS || pq_this_albedo[3] <= EPS) continue;
+        ++count;
+        for (int c = 0; c < 3; ++c) {
+            sum[c] += pq_albedo[c] - shift;
+            sumsqr[c] += (pq_albedo[c] - shift) * (pq_albedo[c] - shift);
+            this_sum[c] += pq_this_albedo[c] - shift;
+            this_sumsqr[c] +=
+                    (pq_this_albedo[c] - shift) * (pq_this_albedo[c] - shift);
+        }
+    }
+    if (count <= MIN_OVERLAP_PIXELS) {
+        utility::LogWarning(
+                "[ProjectImagesToAlbedo] Too few overlapping pixels ({}/{}) "
+                "found for color correction.",
+                count, MIN_OVERLAP_PIXELS);
+        return std::make_tuple(
+                this_contrast, this_brightness,
+                core::Tensor::Zeros({albedo.GetShape(0), albedo.GetShape(1), 1},
+                                    core::Bool),
+                core::Tensor::Zeros({albedo.GetShape(0), albedo.GetShape(1), 1},
+                                    core::Bool));
+    }
+    for (int c = 0; c < 3; ++c) {
+        float variance = (sumsqr[c] - sum[c] * sum[c] / count) / count,
+              this_variance =
+                      (this_sumsqr[c] - this_sum[c] * this_sum[c] / count) /
+                      count;
+        utility::LogWarning("count: {}, variance: {}, this_variance: {}", count,
+                            variance, this_variance);
+        this_contrast[c] = sqrt((variance + EPS) / (this_variance + EPS));
+        sum[c] += count * shift;  // get un-shifted sum for brightness.
+        this_sum[c] += count * shift;
+        this_brightness[c] = (sum[c] - this_contrast[c] * this_sum[c]) / count;
+    }
+
+    // Detect specular highlights from outliers.
+    core::Tensor highlights_mask = core::Tensor::Empty(
+                         {albedo.GetShape(0) / 4, albedo.GetShape(1) / 4, 1},
+                         core::Bool),
+                 this_highlights_mask = core::Tensor::Empty(
+                         {albedo.GetShape(0) / 4, albedo.GetShape(1) / 4, 1},
+                         core::Bool);
+    std::array<float, 3> err{};
+    bool *p_highlights_mask = highlights_mask.GetDataPtr<bool>(),
+         *p_this_highlights_mask = this_highlights_mask.GetDataPtr<bool>();
+    for (float *pq_albedo = q_albedo.GetDataPtr<float>(),
+               *pq_this_albedo = q_this_albedo.GetDataPtr<float>();
+         pq_albedo < q_albedo.GetDataPtr<float>() + q_albedo.NumElements();
+         pq_albedo += 4, pq_this_albedo += 4, ++p_highlights_mask,
+               ++p_this_highlights_mask) {
+        if (pq_albedo[3] <= EPS || pq_this_albedo[3] <= EPS) continue;
+        for (int c = 0; c < 3; ++c) {
+            err[c] = 1.f - (pq_this_albedo[c] * this_contrast[c] +
+                            this_brightness[c]) /
+                                   pq_albedo[c];
+        }
+        *p_highlights_mask =
+                std::min({err[0], err[1], err[2]}) > SPECULAR_THRESHOLD;
+        *p_this_highlights_mask =
+                std::max({err[0], err[1], err[2]}) < -SPECULAR_THRESHOLD;
+    }
+    utility::LogInfo(
+            "n_highlights: {}, n_this_highlights: {}",
+            highlights_mask.To(core::UInt32).Sum({0, 1, 2}).Item<unsigned>(),
+            this_highlights_mask.To(core::UInt32)
+                    .Sum({0, 1, 2})
+                    .Item<unsigned>());
+    // highlights_mask = Image(highlights_mask)
+    //                          .Dilate(/*kernel_size=*/3)
+    //                          .Resize(resize_up)
+    //                          .AsTensor();
+    // this_highlights_mask = Image(this_highlights_mask)
+    //                               .Dilate(/*kernel_size=*/3)
+    //                               .Resize(resize_up)
+    //                               .AsTensor();
+    highlights_mask = core::Tensor::Zeros(
+            {albedo.GetShape(0), albedo.GetShape(1), 1}, core::Bool),
+    this_highlights_mask = core::Tensor::Zeros(
+            {albedo.GetShape(0), albedo.GetShape(1), 1}, core::Bool);
+    return std::make_tuple(this_contrast, this_brightness, highlights_mask,
+                           this_highlights_mask);
+}
+
+}  // namespace
+
+Image TriangleMesh::ProjectImagesToAlbedo(
+        const std::vector<Image> &images,
+        const std::vector<core::Tensor> &intrinsic_matrices,
+        const std::vector<core::Tensor> &extrinsic_matrices,
+        int tex_size /*=1024*/,
+        bool update_material /*=true*/,
+        BlendingMethod blending_method /*=MAX*/) {
+    const bool DEBUG = false;
+    using core::None;
+    using tk = core::TensorKey;
+    constexpr float EPS = 1e-6;
+    constexpr float SPECULAR_THRESHOLD = 0.1f;
+    if (!triangle_attr_.Contains("texture_uvs")) {
+        utility::LogError("Cannot find triangle attribute 'texture_uvs'");
+    }
+    if (!TEST_ENUM_FLAG(BlendingMethod, blending_method, MAX) &&
+        !TEST_ENUM_FLAG(BlendingMethod, blending_method, AVERAGE)) {
+        utility::LogError("Select one of MAX and AVERAGE BlendingMethod s.");
+    }
+    core::Tensor texture_uvs =
+            triangle_attr_.at("texture_uvs").To(core::Device()).Contiguous();
+    core::AssertTensorShape(texture_uvs, {core::None, 3, 2});
+    core::AssertTensorDtype(texture_uvs, {core::Float32});
+
+    if (images.size() != extrinsic_matrices.size() ||
+        images.size() != intrinsic_matrices.size()) {
+        utility::LogError(
+                "Received {} images, but {} extrinsic matrices and {} "
+                "intrinsic matrices.",
+                images.size(), extrinsic_matrices.size(),
+                intrinsic_matrices.size());
+    }
+    // (u,v) -> (x,y,z) : {tex_size, tex_size, 3}
+    core::Tensor position_map = BakeVertexAttrTextures(
+            tex_size, {"positions"}, 1, 0, false)["positions"];
+    if (DEBUG) {
+        io::WriteImage("position_map.png",
+                       Image(((position_map + 1) * 127.5).To(core::UInt8)));
+    }
+    core::Tensor albedo =
+            core::Tensor::Zeros({tex_size, tex_size, 4}, core::Float32);
+    std::mutex albedo_mutex;
+    albedo.Slice(2, 3, 4, 1).Fill(EPS);  // regularize
+
+    RaycastingScene rcs;
+    rcs.AddTriangles(*this);
+
+    // Simulate thread_local Tensors with a vector of Tensors. thread_local
+    // variables are only destructed when the TBB thread pool is finalized which
+    // can cause memory leaks in Python code / long running processes.
+    // Also TBB can schedule multiple tasks on one thread at the same time
+    size_t max_workers = tbb::this_task_arena::max_concurrency();
+    // Tensor copy ctor does shallow copies - OK for empty tensors.
+    std::vector<core::Tensor> this_albedo(max_workers,
+                                          core::Tensor({}, core::Float32)),
+            weighted_image(max_workers, core::Tensor({}, core::Float32)),
+            uv2xy(max_workers, core::Tensor({}, core::Float32)),
+            uvrays(max_workers, core::Tensor({}, core::Float32));
+
+    // Used to control order of blending projected images into the texture. This
+    // ensures correct computation of color matching (only neded for
+    // COLOR_CORRECTION).
+    std::condition_variable cv_next_blend_image;
+    size_t next_blend_image{0};
+    /* auto project_one_image = [&](size_t i, tbb::feeder<size_t> &feeder) { */
+    auto project_one_image = [&](size_t i,
+                                 tbb::parallel_do_feeder<size_t> &feeder) {
+        size_t widx = tbb::this_task_arena::current_thread_index();
+        // initialize thread variables
+        if (!this_albedo[widx].GetShape().IsCompatible(
+                    {tex_size, tex_size, 4})) {
+            this_albedo[widx] =
+                    core::Tensor::Empty({tex_size, tex_size, 4}, core::Float32);
+            uvrays[widx] =
+                    core::Tensor::Empty({tex_size, tex_size, 6}, core::Float32);
+        }
+        auto i_str = std::to_string(i);
+        auto width = images[i].GetCols(), height = images[i].GetRows();
+        if (!weighted_image[widx].GetShape().IsCompatible({height, width, 4})) {
+            weighted_image[widx] =
+                    core::Tensor({height, width, 4}, core::Float32);
+        }
+        core::AssertTensorShape(intrinsic_matrices[i], {3, 3});
+        core::AssertTensorShape(extrinsic_matrices[i], {4, 4});
+
+        // A. Get image space weight matrix, as inverse of pixel
+        // footprint on the mesh.
+        auto rays = RaycastingScene::CreateRaysPinhole(
+                intrinsic_matrices[i], extrinsic_matrices[i], width, height);
+        core::Tensor cam_loc =
+                rays.GetItem({tk::Index(0), tk::Index(0), tk::Slice(0, 3, 1)});
+
+        // A nested parallel_for's threads must be isolated from the threads
+        // running this paralel_for, else we get BAD ACCESS errors.
+        auto result = tbb::this_task_arena::isolate(
+                [&rays, &rcs]() { return rcs.CastRays(rays); });
+        // Eigen is column-major order
+        Eigen::Map<Eigen::ArrayXXf> normals_e(
+                result["primitive_normals"].GetDataPtr<float>(), 3,
+                width * height);
+        Eigen::Map<Eigen::ArrayXXf> rays_e(rays.GetDataPtr<float>(), 6,
+                                           width * height);
+        Eigen::Map<Eigen::ArrayXXf> t_hit(result["t_hit"].GetDataPtr<float>(),
+                                          1, width * height);
+        auto depth = t_hit * rays_e.bottomRows<3>().colwise().norm().array();
+        // removing this eval() increase runtime a lot (?)
+        auto rays_dir = rays_e.bottomRows<3>().colwise().normalized().eval();
+        auto pixel_foreshortening = (normals_e * rays_dir)
+                                            .colwise()
+                                            .sum()
+                                            .abs();  // ignore face orientation
+        // fix for bad normals
+        auto inv_footprint =
+                pixel_foreshortening.isNaN().select(0, pixel_foreshortening) /
+                (depth * depth);
+
+        utility::LogDebug(
+                "[ProjectImagesToAlbedo] Image {}, weight (inv_footprint) "
+                "range: {}-{}",
+                i, inv_footprint.minCoeff(), inv_footprint.maxCoeff());
+        weighted_image[widx].Slice(2, 0, 3, 1) =
+                images[i].To(core::Float32).AsTensor();  // range: [0,1]
+        Eigen::Map<Eigen::MatrixXf> weighted_image_e(
+                weighted_image[widx].GetDataPtr<float>(), 4, width * height);
+        weighted_image_e.bottomRows<1>() = inv_footprint;
+
+        // B. Get texture space (u,v) -> (x,y) map and valid domain in
+        // uv space.
+        uvrays[widx].GetItem({tk::Slice(0, None, 1), tk::Slice(0, None, 1),
+                              tk::Slice(0, 3, 1)}) = cam_loc;
+        uvrays[widx].GetItem({tk::Slice(0, None, 1), tk::Slice(0, None, 1),
+                              tk::Slice(3, 6, 1)}) = position_map - cam_loc;
+        // A nested parallel_for's threads must be isolated from the threads
+        // running this paralel_for, else we get BAD ACCESS errors.
+        result = tbb::this_task_arena::isolate(
+                [&rcs, &uvrays, widx]() { return rcs.CastRays(uvrays[widx]); });
+        auto &t_hit_uv = result["t_hit"];
+        if (DEBUG) {
+            io::WriteImage("t_hit_uv_" + i_str + ".png",
+                           Image((t_hit_uv * 255).To(core::UInt8)));
+        }
+
+        Project(position_map, intrinsic_matrices[i], extrinsic_matrices[i],
+                uv2xy[widx]);  // {ts, ts, 2}
+        // Disable self-occluded points
+        for (float *p_uv2xy = uv2xy[widx].GetDataPtr<float>(),
+                   *p_t_hit = t_hit_uv.GetDataPtr<float>();
+             p_uv2xy <
+             uv2xy[widx].GetDataPtr<float>() + uv2xy[widx].NumElements();
+             p_uv2xy += 2, ++p_t_hit) {
+            if (*p_t_hit < 1 - EPS) *p_uv2xy = *(p_uv2xy + 1) = -1.f;
+        }
+        core::Tensor uv2xy2 =
+                uv2xy[widx].Permute({2, 0, 1}).Contiguous();  // {2, ts, ts}
+        if (DEBUG) {
+            io::WriteImage("uv2x_" + i_str + ".png",
+                           Image((uv2xy2[0].To(core::UInt16))));
+            io::WriteImage("uv2y_" + i_str + ".png",
+                           Image((uv2xy2[1].To(core::UInt16))));
+        }
+
+        // C. Interpolate weighted image to weighted texture
+        // albedo[u,v] = image[ i[u,v], j[u,v] ]
+        this_albedo[widx].Fill(0.f);
+        ipp::Remap(weighted_image[widx], /*{height, width, 4} f32*/
+                   uv2xy2[0],            /* {texsz, texsz} f32*/
+                   uv2xy2[1],            /* {texsz, texsz} f32*/
+                   this_albedo[widx],    /*{texsz, texsz, 4} f32*/
+                   t::geometry::Image::InterpType::Linear);
+        // Weights can become negative with higher order interpolation
+        if (DEBUG) {
+            io::WriteImage("this_albedo_" + i_str + ".png",
+                           Image((this_albedo[widx].Slice(2, 0, 3, 1) * 255)
+                                         .To(core::UInt8)));
+            float wtmin = this_albedo[widx]
+                                  .Slice(2, 3, 4, 1)
+                                  .Min({0, 1, 2})
+                                  .Item<float>(),
+                  wtmax = this_albedo[widx]
+                                  .Slice(2, 3, 4, 1)
+                                  .Max({0, 1, 2})
+                                  .Item<float>();
+            io::WriteImage(
+                    "image_weights_" + i_str + ".png",
+                    Image(weighted_image[widx].Slice(2, 3, 4, 1).Contiguous())
+                            .To(core::UInt8, /*copy=*/false,
+                                /*scale=*/255.f / (wtmax - wtmin),
+                                /*offset=*/-wtmin * 255.f / (wtmax - wtmin)));
+            io::WriteImage(
+                    "this_albedo_weight_" + i_str + ".png",
+                    Image(this_albedo[widx].Slice(2, 3, 4, 1).Contiguous())
+                            .To(core::UInt8, /*copy=*/false,
+                                /*scale=*/255.f / (wtmax - wtmin),
+                                /*offset=*/-wtmin * 255.f / (wtmax - wtmin)));
+        }
+        std::array<float, 3> this_contrast{1.f, 1.f, 1.f},
+                this_brightness{0.f, 0.f, 0.f};
+        core::Tensor highlights_mask, this_highlights_mask;
+
+        std::unique_lock<std::mutex> albedo_lock{albedo_mutex};
+        if (TEST_ENUM_FLAG(BlendingMethod, blending_method, COLOR_CORRECTION)) {
+            // Ensure images are blended in order to correctly calculate
+            // color correction
+            cv_next_blend_image.wait(albedo_lock, [&i, &next_blend_image]() {
+                return next_blend_image == i;
+            });
+            std::tie(this_contrast, this_brightness, highlights_mask,
+                     this_highlights_mask) =
+                    get_color_correction(albedo, this_albedo[widx],
+                                         SPECULAR_THRESHOLD);
+            utility::LogInfo(
+                    "[ProjectImagesToAlbedo] Image {}, contrast: {}, "
+                    "brightness {}",
+                    i_str, this_contrast, this_brightness);
+        }
+        if (TEST_ENUM_FLAG(BlendingMethod, blending_method, MAX)) {
+            utility::LogInfo("Blending image {} with method MAX", i_str);
+            // Select albedo value with max weight
+            for (auto p_albedo = albedo.GetDataPtr<float>(),
+                      p_this_albedo = this_albedo[widx].GetDataPtr<float>();
+                 p_albedo < albedo.GetDataPtr<float>() + albedo.NumElements();
+                 p_albedo += 4, p_this_albedo += 4) {
+                if (p_albedo[3] < p_this_albedo[3]) {
+                    for (auto k = 0; k < 3; ++k)
+                        p_albedo[k] = this_contrast[k] * p_this_albedo[k] +
+                                      this_brightness[k];
+                    p_albedo[3] = p_this_albedo[3];
+                }
+            }
+        } else if (TEST_ENUM_FLAG(BlendingMethod, blending_method, AVERAGE)) {
+            utility::LogInfo("Blending image {} with method AVERAGE", i_str);
+            for (auto p_albedo = albedo.GetDataPtr<float>(),
+                      p_this_albedo = this_albedo[widx].GetDataPtr<float>();
+                 p_albedo < albedo.GetDataPtr<float>() + albedo.NumElements();
+                 p_albedo += 4, p_this_albedo += 4) {
+                for (auto k = 0; k < 3; ++k)
+                    p_albedo[k] += (this_contrast[k] * p_this_albedo[k] +
+                                    this_brightness[k]) *
+                                   p_this_albedo[3];
+                p_albedo[3] += p_this_albedo[3];
+            }
+        }
+        if (TEST_ENUM_FLAG(BlendingMethod, blending_method, COLOR_CORRECTION)) {
+            cv_next_blend_image.notify_all();
+            if (next_blend_image + max_workers < images.size()) {
+                feeder.add(next_blend_image + max_workers);
+            }
+            ++next_blend_image;
+        }
+    };
+
+    size_t n_init_images =
+            TEST_ENUM_FLAG(BlendingMethod, blending_method, COLOR_CORRECTION)
+                    ? std::min(max_workers, images.size())
+                    : images.size();
+    std::vector<size_t> range(n_init_images, 0);
+    std::iota(range.begin(), range.end(), 0);
+    /* tbb::parallel_for_each(range, project_one_image); */
+    tbb::parallel_do(range.begin(), range.end(), project_one_image);
+    if (TEST_ENUM_FLAG(BlendingMethod, blending_method, AVERAGE)) {
+        albedo.Slice(2, 0, 3, 1) /= albedo.Slice(2, 3, 4, 1);
+    }
+
+    Image albedo_texture((albedo.Slice(2, 0, 3, 1) * 255).To(core::UInt8));
+    if (update_material) {
+        if (!HasMaterial()) {
+            SetMaterial(visualization::rendering::Material());
+            GetMaterial().SetDefaultProperties();  // defaultUnlit
+        }
+        GetMaterial().SetAlbedoMap(albedo_texture);
+    }
+    return albedo_texture;
 }
 
 }  // namespace geometry

@@ -8,11 +8,18 @@
 #include "open3d/t/geometry/TriangleMesh.h"
 
 #include <gmock/gmock.h>
+#include <gtest/gtest.h>
 
 #include "core/CoreTest.h"
 #include "open3d/core/Dtype.h"
 #include "open3d/core/EigenConverter.h"
+#include "open3d/core/SizeVector.h"
+#include "open3d/core/Tensor.h"
 #include "open3d/core/TensorCheck.h"
+#include "open3d/geometry/LineSet.h"
+#include "open3d/t/io/ImageIO.h"
+#include "open3d/t/io/TriangleMeshIO.h"
+#include "open3d/visualization/utility/Draw.h"
 #include "tests/Tests.h"
 
 namespace open3d {
@@ -1341,6 +1348,56 @@ TEST_P(TriangleMeshPermuteDevices, RemoveUnreferencedVertices) {
     EXPECT_TRUE(torus.GetVertexAttr("labels").AllClose(expected_vert_labels));
     EXPECT_TRUE(torus.GetTriangleIndices().AllClose(expected_tris));
     EXPECT_TRUE(torus.GetTriangleNormals().AllClose(expected_tri_normals));
+}
+
+TEST_P(TriangleMeshPermuteDevices, ProjectImagesToAlbedo) {
+    using namespace t::geometry;
+    using ::testing::ElementsAre;
+    using ::testing::FloatEq;
+    core::Device device = GetParam();
+    TriangleMesh sphere =
+            TriangleMesh::FromLegacy(*geometry::TriangleMesh::CreateSphere(
+                    1.0, 20, /*create_uv_map=*/true));
+    core::Tensor view[3] = {core::Tensor::Zeros({192, 256, 3}, core::Float32),
+                            core::Tensor::Zeros({192, 256, 3}, core::Float32),
+                            core::Tensor::Zeros({192, 256, 3}, core::Float32)};
+    view[0].Slice(2, 0, 1, 1).Fill(1.0);  // red
+    view[1].Slice(2, 1, 2, 1).Fill(1.0);  // green
+    view[2].Slice(2, 2, 3, 1).Fill(1.0);  // blue
+    core::Tensor intrinsic_matrix = core::Tensor::Init<float>(
+            {{256, 0, 128}, {0, 256, 96}, {0, 0, 1}}, device);
+    core::Tensor extrinsic_matrix[3] = {
+            core::Tensor::Init<float>(
+                    {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 3}, {0, 0, 0, 1}},
+                    device),
+            core::Tensor::Init<float>({{-0.5, 0, -0.8660254, 0},
+                                       {0, 1, 0, 0},
+                                       {0.8660254, 0, -0.5, 3},
+                                       {0, 0, 0, 1}},
+                                      device),
+            core::Tensor::Init<float>({{-0.5, 0, 0.8660254, 0},
+                                       {0, 1, 0, 0},
+                                       {-0.8660254, 0, -0.5, 3},
+                                       {0, 0, 0, 1}},
+                                      device),
+    };
+
+    Image albedo = sphere.ProjectImagesToAlbedo(
+            {Image(view[0]), Image(view[1]), Image(view[2])},
+            {intrinsic_matrix, intrinsic_matrix, intrinsic_matrix},
+            {extrinsic_matrix[0], extrinsic_matrix[1], extrinsic_matrix[2]},
+            256, true, BlendingMethod::MAX | BlendingMethod::COLOR_CORRECTION);
+
+    EXPECT_TRUE(sphere.HasMaterial());
+    EXPECT_TRUE(sphere.GetMaterial().HasAlbedoMap());
+    EXPECT_TRUE(albedo.AsTensor().GetShape().IsCompatible({256, 256, 3}));
+    EXPECT_TRUE(albedo.GetDtype() == core::UInt8);
+    EXPECT_THAT(albedo.AsTensor()
+                        .To(core::Float32)
+                        .Mean({0, 1})
+                        .ToFlatVector<float>(),
+                ElementsAre(FloatEq(92.465515), FloatEq(71.62926),
+                            FloatEq(67.55928)));
 }
 
 }  // namespace tests
