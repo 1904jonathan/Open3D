@@ -35,7 +35,6 @@ set(CPACK_THREADS 0)  # Use all cores for compressing package
 
 if (BUILD_DEBIAN_PACKAGE)
     list(APPEND CPACK_GENERATOR DEB)
-    set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
     set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS YES)
 endif()
 
