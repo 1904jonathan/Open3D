@@ -142,7 +142,7 @@ if (NOT DEVELOPER_BUILD)
     endif()
 endif()
 
-option(BUILD_DEBIAN_PACKAGE "Build debian package" OFF)
+option(BUILD_DEBIAN_PACKAGE "Build debian package" ON)
 # will work with cmake 3.22 and newer
 # https://cmake.org/cmake/help/latest/command/cmake_host_system_information.html
 if (BUILD_DEBIAN_PACKAGE)

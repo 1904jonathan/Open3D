@@ -1,13 +1,7 @@
 # This is packaging for the Open3D library. See
 # cpp/apps/Open3DViewer/Debian/CMakeLists.txt for packaging the Debian Open3D
 # viewer
-if (BUILD_DEBIAN_PACKAGE)
-    set(CPACK_GENERATOR DEB)
-    set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
-    set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS YES)
-else()
-    set(CPACK_GENERATOR TXZ)
-endif()
+set(CPACK_GENERATOR TXZ)
 if(WIN32)
     set(CPACK_GENERATOR ZIP)
 endif()
@@ -38,5 +32,11 @@ endif()
 set(CPACK_PACKAGE_FILE_NAME
     "open3d-devel-${_sys}-${OPEN3D_VERSION_FULL}")
 set(CPACK_THREADS 0)  # Use all cores for compressing package
+
+if (BUILD_DEBIAN_PACKAGE)
+    list(APPEND CPACK_GENERATOR DEB)
+    set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+    set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS YES)
+endif()
 
 include(CPack)
